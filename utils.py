@@ -42,6 +42,13 @@ from torchvision.utils import save_image, make_grid
 
 # global definition
 from definition import *
+import json
+
+# Load the word-to-POS JSON file
+with open('word_to_pos.json', 'r', encoding='utf-8') as f:
+    pos_dict = json.load(f)
+
+WORD_MASK = "<MASK>"  # Define the mask token
 
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
@@ -258,7 +265,6 @@ def init_distributed_mode(args):
         return
 
     args.distributed = True
-
     torch.cuda.set_device(args.gpu)
     args.dist_backend = 'nccl'
     print('| distributed init (rank {}): {}'.format(
@@ -351,6 +357,7 @@ def NoiseInjecting(raw_gloss, noise_rate=0.15, noise_type='omit_last', random_sh
 
     for ii, gloss in enumerate(raw_gloss):
         text = gloss.split()
+        print(text)
 
         if noise_type == 'omit':
             # del noise
@@ -376,8 +383,17 @@ def NoiseInjecting(raw_gloss, noise_rate=0.15, noise_type='omit_last', random_sh
                         noise_gloss.append(d)
                     else:
                         noise_gloss.append(WORD_MASK)
-            else:
-                noise_gloss = [d for d in text]
+
+        elif noise_type == 'smart_mask':
+            if random.uniform(0, 1) <= 1. and is_train:
+            # Smart mask verbs and nouns with randomness
+                noise_gloss = []
+                for word in text:
+                    if word in pos_dict and pos_dict[word] in ["NOUN"]:
+                        if random.uniform(0, 1) < noise_rate:
+                            noise_gloss.append(WORD_MASK)
+                        else:
+                            noise_gloss.append(word)
         
         if is_train and random_shuffle and random.uniform(0, 1) > 0.5:
             random.shuffle(noise_gloss) # random shuffle sequence
