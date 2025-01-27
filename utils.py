@@ -45,8 +45,8 @@ from definition import *
 import json
 
 # Load the word-to-POS JSON file
-with open('word_to_pos.json', 'r', encoding='utf-8') as f:
-    pos_dict = json.load(f)
+# with open('word_to_pos.json', 'r', encoding='utf-8') as f:
+    # pos_dict = json.load(f)
 
 WORD_MASK = "<MASK>"  # Define the mask token
 
@@ -357,7 +357,6 @@ def NoiseInjecting(raw_gloss, noise_rate=0.15, noise_type='omit_last', random_sh
 
     for ii, gloss in enumerate(raw_gloss):
         text = gloss.split()
-        print(text)
 
         if noise_type == 'omit':
             # del noise

@@ -25,7 +25,6 @@ for key, value in raw_data.items():
             data_dict[token.text] = "PROPN"
 
 # Print the dictionary for verification
-print(data_dict)
 
 # Write the dictionary to a JSON file
 with open('word_to_pos.json', 'w', encoding='utf-8') as f:

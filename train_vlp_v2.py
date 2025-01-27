@@ -112,13 +112,13 @@ def get_args_parser():
     
     parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
                         help='epoch interval to decay LR')
-    parser.add_argument('--warmup-epochs', type=int, default=2, metavar='N',
+    parser.add_argument('--warmup-epochs', type=int, default=1, metavar='N',
                         help='epochs to warmup LR, if scheduler supports')
     parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
                         help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
     parser.add_argument('--patience-epochs', type=int, default=10, metavar='N',
                         help='patience epochs for Plateau LR scheduler (default: 10')
-    parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
+    parser.add_argument('--decay-rate', '--dr', type=float, default=0.05, metavar='RATE',
                         help='LR decay rate (default: 0.1)')
     
      # * Baise params
@@ -166,8 +166,6 @@ def get_args_parser():
                         help='lambda param')
     parser.add_argument('--name', type=str,  metavar='EXP_NAME',
                         help='name wandb')
-    parser.add_argument('--name', type=str,  metavar='EXP_NAME',
-                        help='name wandb')
 
 
 
@@ -201,7 +199,6 @@ def main(args, config):
     
     
     dev_data = S2T_Dataset(path=config['data']['dev_label_path'], tokenizer = tokenizer, config=config, args=args, phase='val', training_refurbish=True)
-    print(dev_data)
     dev_sampler = torch.utils.data.distributed.DistributedSampler(dev_data,shuffle=False)
     dev_dataloader = DataLoader(dev_data,
                                  batch_size=args.batch_size,
@@ -211,7 +208,6 @@ def main(args, config):
                                  pin_memory=args.pin_mem)
 
     test_data = S2T_Dataset(path=config['data']['test_label_path'], tokenizer = tokenizer, config=config, args=args, phase='test', training_refurbish=True)
-    print(test_data)
     test_sampler = torch.utils.data.distributed.DistributedSampler(test_data,shuffle=False)
     test_dataloader = DataLoader(test_data,
                                  batch_size=args.batch_size,
@@ -221,7 +217,7 @@ def main(args, config):
                                  pin_memory=args.pin_mem)
 
     print(f"Creating model:")
-    model = SLRCLIP(config=config, semantic_lambda=args.semantic_lambda_mix)
+    model = SLRCLIP(config=config)
     model.to(device)
 
     if args.finetune:
@@ -349,11 +345,22 @@ def main(args, config):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
-def train_one_epoch(args, model: torch.nn.Module, criterion: nn.CrossEntropyLoss,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, config, PAD_IDX, loss_scaler, 
-                    TD_train_dict, max_norm: float = 0, set_training_mode=True,
-                    gradient_accumulation_steps: int = 1):
+def train_one_epoch(
+    args,
+    model: torch.nn.Module,
+    criterion: nn.CrossEntropyLoss,
+    data_loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    config,
+    PAD_IDX,
+    loss_scaler,  # old-style NativeScaler
+    TD_train_dict,
+    max_norm: float = 0,
+    set_training_mode=True,
+    gradient_accumulation_steps: int = 1
+):
     model.train(set_training_mode)
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -362,45 +369,60 @@ def train_one_epoch(args, model: torch.nn.Module, criterion: nn.CrossEntropyLoss
     print_freq = 10
 
     loss_fct = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=0.2)
+    
     accum_steps = 0
-    total_accumulated_loss = 0.0  # Track accumulated loss
+    total_accumulated_loss = 0.0
 
-    for step, (src_input, tgt_input, masked_tgt_input) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        # Reset gradients only at start of accumulation cycle
+    # Extract the underlying torch.cuda.amp.GradScaler (often stored in loss_scaler._scaler)
+    grad_scaler = loss_scaler._scaler  # or loss_scaler._amp_scaler, etc. 
+
+    for step, (src_input, tgt_input, masked_tgt_input) in enumerate(
+        metric_logger.log_every(data_loader, print_freq, header)
+    ):
+
         if accum_steps == 0:
             optimizer.zero_grad()
 
+        # Forward pass under autocast
         with torch.cuda.amp.autocast():
-            # Forward pass and loss calculation
             outputs = model(src_input, tgt_input)
             loss_imgs = criterion(outputs["logits_per_image"], outputs["ground_truth"])
             loss_texts = criterion(outputs["logits_per_text"], outputs["ground_truth"])
-            regular_loss = (loss_imgs + loss_texts) / 2.
-            total_loss_step = regular_loss
+            total_loss_step = (loss_imgs + loss_texts) / 2.0
 
-        # Scale loss for gradient accumulation
+        # Scale the loss for gradient accumulation
         scaled_loss = total_loss_step / gradient_accumulation_steps
-        loss_scaler(scaled_loss, optimizer, create_graph=False, update_grad=False)
-        
-        accum_steps += 1
-        total_accumulated_loss += total_loss_step.item()  # Accumulate loss
 
-        # Perform optimizer step at accumulation boundaries
+        # 1) Scale and call backward (but do NOT step yet)
+        grad_scaler.scale(scaled_loss).backward()
+
+        accum_steps += 1
+        total_accumulated_loss += total_loss_step.item()
+
+        # 2) Only step the optimizer on the accumulation boundary
         if accum_steps % gradient_accumulation_steps == 0:
-            if max_norm is not None:
+            if max_norm is not None and max_norm > 0:
+                # Unscale before clipping
+                grad_scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            loss_scaler.step(optimizer)
+
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
             optimizer.zero_grad()
+
+            # Logging
+            avg_loss = total_accumulated_loss / gradient_accumulation_steps
+            metric_logger.update(loss=avg_loss)
+            total_accumulated_loss = 0.0
             accum_steps = 0
 
-            # Update metrics with accumulated loss
-            metric_logger.update(loss=total_accumulated_loss/gradient_accumulation_steps)
-            total_accumulated_loss = 0.0
-
-        # Text decoder updates (every 5 steps, independent of main model accumulation)
+        # ---------------------------
+        # Text Decoder Update (no grad accumulation)
+        # ---------------------------
         if step % 5 == 0:
             TD_optim = TD_train_dict['optimizer']
             TD_optim.zero_grad()
+
             with torch.cuda.amp.autocast():
                 lm_logits = TD_train_dict['text_decoder'](
                     tgt_input, masked_tgt_input, model.module.model_txt
@@ -409,28 +431,34 @@ def train_one_epoch(args, model: torch.nn.Module, criterion: nn.CrossEntropyLoss
                     lm_logits.view(-1, lm_logits.shape[-1]),
                     tgt_input['input_ids'].cuda().view(-1)
                 ) * args.loss_lambda
-            
-            # Scale and update text decoder
-            scaled_td_loss = masked_lm_loss / gradient_accumulation_steps
-            loss_scaler(scaled_td_loss, TD_optim, create_graph=False, update_grad=True)
-            if max_norm is not None:
-                torch.nn.utils.clip_grad_norm_(TD_train_dict['text_decoder'].parameters(), max_norm)
+
+            # Single-step backward + step (no accumulation) for text decoder
+            grad_scaler.scale(masked_lm_loss).backward()
+
+            if max_norm is not None and max_norm > 0:
+                grad_scaler.unscale_(TD_optim)
+                torch.nn.utils.clip_grad_norm_(
+                    TD_train_dict['text_decoder'].parameters(), max_norm
+                )
+
+            grad_scaler.step(TD_optim)
+            grad_scaler.update()
             
             metric_logger.update(masked_lm_loss=masked_lm_loss.item())
 
-        # Learning rate logging
+        # Logging LRs
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(td_lr=TD_train_dict['optimizer'].param_groups[0]["lr"])
 
-        # Handle NaN losses
+        # NaN check
         if not math.isfinite(total_loss_step.item()):
-            print("Loss is {}, stopping training".format(total_loss_step.item()))
+            print(f"Loss is {total_loss_step.item()}, stopping training")
             sys.exit(1)
 
-    # Final metrics and logging
+    # Final metrics & logging
     if args.run:
         args.run.log({
-            'epoch': epoch+1,
+            'epoch': epoch + 1,
             'epoch/train_loss': metric_logger.meters['loss'].global_avg,
             'epoch/masked_lm_loss': metric_logger.meters['masked_lm_loss'].global_avg
         })
