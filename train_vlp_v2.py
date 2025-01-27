@@ -59,11 +59,15 @@ import hpargparse
 # global definition
 from definition import *
 
+import warnings
+warnings.filterwarnings("ignore") # too many issues with versions
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Visual-Language-Pretraining (VLP) V2 scripts', add_help=False)
     parser.add_argument('--batch-size', default=16, type=int)
     parser.add_argument('--epochs', default=80, type=int)
+    parser.add_argument('--gradient_accumulation_steps', default=4, type=int)
 
 
     # distributed training parameters
@@ -87,7 +91,7 @@ def get_args_parser():
                         help='Clip gradient norm (default: None, no clipping)')
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
-    parser.add_argument('--weight-decay', type=float, default=0.0,
+    parser.add_argument('--weight-decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
 
     # * Learning rate schedule parameters
@@ -108,7 +112,7 @@ def get_args_parser():
     
     parser.add_argument('--decay-epochs', type=float, default=30, metavar='N',
                         help='epoch interval to decay LR')
-    parser.add_argument('--warmup-epochs', type=int, default=0, metavar='N',
+    parser.add_argument('--warmup-epochs', type=int, default=2, metavar='N',
                         help='epochs to warmup LR, if scheduler supports')
     parser.add_argument('--cooldown-epochs', type=int, default=10, metavar='N',
                         help='epochs to cooldown LR at min_lr, after cyclic schedule ends')
@@ -149,23 +153,31 @@ def get_args_parser():
     parser.add_argument("--project", type=str, default='VLP',
         help="wandb project",
     )
-
     # * Noise params
     parser.add_argument('--training-refurbish', default=True, type=bool)
     parser.add_argument('--noise-rate', default=0.15, type=float)
-    parser.add_argument('--noise-type', default='omit_last', type=str, choices=['omit', 'omit_last'])
+    parser.add_argument('--noise-type', default='omit_last', type=str, choices=['omit', 'omit_last', 'smart_mask'])
+    parser.add_argument('--smart-mask', default='NOUN', type=str)
     parser.add_argument('--random-shuffle', default=False, type=bool)
-
     parser.add_argument('--loss-lambda', type=float, default=1.0, metavar='RATE',
                         help='lambda param')
+    parser.add_argument('--semantic_aware', default=False, type=bool)
+    parser.add_argument('--semantic_lambda_mix', type=float, default=0.5, metavar='SEMANTIC_MIXER',
+                        help='lambda param')
+    parser.add_argument('--name', type=str,  metavar='EXP_NAME',
+                        help='name wandb')
+    parser.add_argument('--name', type=str,  metavar='EXP_NAME',
+                        help='name wandb')
+
+
 
     return parser
 
 def main(args, config):
     utils.init_distributed_mode(args)
-    print(args)
 
     device = torch.device(args.device)
+    torch.cuda.set_device(args.gpu)
 
     # fix the seed for reproducibility
     seed = args.seed + utils.get_rank()
@@ -178,7 +190,6 @@ def main(args, config):
     tokenizer = MBartTokenizer.from_pretrained(config['model']['tokenizer'])
 
     train_data = S2T_Dataset(path=config['data']['train_label_path'], tokenizer = tokenizer, config=config, args=args, phase='train', training_refurbish=True)
-    print(train_data)
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_data,shuffle=True)
     train_dataloader = DataLoader(train_data,
                                  batch_size=args.batch_size, 
@@ -210,9 +221,8 @@ def main(args, config):
                                  pin_memory=args.pin_mem)
 
     print(f"Creating model:")
-    model = SLRCLIP(config=config)
+    model = SLRCLIP(config=config, semantic_lambda=args.semantic_lambda_mix)
     model.to(device)
-    print(model)
 
     if args.finetune:
         checkpoint = torch.load(args.finetune, map_location='cpu')
@@ -221,10 +231,9 @@ def main(args, config):
         print('Unexpected keys: \n', '\n'.join(ret.unexpected_keys))
 
     model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        model_without_ddp = model.module
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+    model_without_ddp = model.module
     n_parameters = utils.count_parameters_in_MB(model_without_ddp)
     print(f'number of params: {n_parameters}M')
 
@@ -276,10 +285,9 @@ def main(args, config):
     min_loss = np.inf
     for epoch in range(args.start_epoch, args.epochs):
         
-        if args.distributed:
-            train_dataloader.sampler.set_epoch(epoch)
+        train_dataloader.sampler.set_epoch(epoch)
         
-        train_stats = train_one_epoch(args, model, criterion, train_dataloader, optimizer, device, epoch, config, PAD_IDX, loss_scaler, TD_train_dict)
+        train_stats = train_one_epoch(args, model, criterion, train_dataloader, optimizer, device, epoch, config, PAD_IDX, loss_scaler, TD_train_dict, gradient_accumulation_steps=args.gradient_accumulation_steps)
         lr_scheduler.step(epoch)
         TD_train_dict['lr_scheduler'].step(epoch)
 
@@ -343,58 +351,92 @@ def main(args, config):
 
 def train_one_epoch(args, model: torch.nn.Module, criterion: nn.CrossEntropyLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, config, PAD_IDX, loss_scaler, TD_train_dict, max_norm: float = 0,
-                    set_training_mode=True):
+                    device: torch.device, epoch: int, config, PAD_IDX, loss_scaler, 
+                    TD_train_dict, max_norm: float = 0, set_training_mode=True,
+                    gradient_accumulation_steps: int = 1):
     model.train(set_training_mode)
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
+    header = f'Epoch: [{epoch}/{args.epochs}]'
     print_freq = 10
-    loss_img = criterion
-    loss_txt = criterion
-    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX,label_smoothing=0.2)
+
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=PAD_IDX, label_smoothing=0.2)
+    accum_steps = 0
+    total_accumulated_loss = 0.0  # Track accumulated loss
 
     for step, (src_input, tgt_input, masked_tgt_input) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        # Reset gradients only at start of accumulation cycle
+        if accum_steps == 0:
+            optimizer.zero_grad()
 
-        optimizer.zero_grad()
         with torch.cuda.amp.autocast():
-            logits_per_image, logits_per_text, ground_truth = model(src_input, tgt_input)
-            loss_imgs = loss_img(logits_per_image,ground_truth)
-            loss_texts = loss_txt(logits_per_text,ground_truth)
-            total_loss = (loss_imgs + loss_texts)/2.
-        loss_scaler(total_loss, optimizer)
+            # Forward pass and loss calculation
+            outputs = model(src_input, tgt_input)
+            loss_imgs = criterion(outputs["logits_per_image"], outputs["ground_truth"])
+            loss_texts = criterion(outputs["logits_per_text"], outputs["ground_truth"])
+            regular_loss = (loss_imgs + loss_texts) / 2.
+            total_loss_step = regular_loss
 
-        # update the text decoder parames
+        # Scale loss for gradient accumulation
+        scaled_loss = total_loss_step / gradient_accumulation_steps
+        loss_scaler(scaled_loss, optimizer, create_graph=False, update_grad=False)
+        
+        accum_steps += 1
+        total_accumulated_loss += total_loss_step.item()  # Accumulate loss
+
+        # Perform optimizer step at accumulation boundaries
+        if accum_steps % gradient_accumulation_steps == 0:
+            if max_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            loss_scaler.step(optimizer)
+            optimizer.zero_grad()
+            accum_steps = 0
+
+            # Update metrics with accumulated loss
+            metric_logger.update(loss=total_accumulated_loss/gradient_accumulation_steps)
+            total_accumulated_loss = 0.0
+
+        # Text decoder updates (every 5 steps, independent of main model accumulation)
         if step % 5 == 0:
-            TD_train_dict['optimizer'].zero_grad()
+            TD_optim = TD_train_dict['optimizer']
+            TD_optim.zero_grad()
             with torch.cuda.amp.autocast():
-                lm_logits = TD_train_dict['text_decoder'](tgt_input, masked_tgt_input, model.module.model_txt)
-                masked_lm_loss = loss_fct(lm_logits.view(-1, lm_logits.shape[-1]), tgt_input['input_ids'].cuda().view(-1)) * args.loss_lambda
-            loss_scaler(masked_lm_loss, TD_train_dict['optimizer'])
+                lm_logits = TD_train_dict['text_decoder'](
+                    tgt_input, masked_tgt_input, model.module.model_txt
+                )
+                masked_lm_loss = loss_fct(
+                    lm_logits.view(-1, lm_logits.shape[-1]),
+                    tgt_input['input_ids'].cuda().view(-1)
+                ) * args.loss_lambda
+            
+            # Scale and update text decoder
+            scaled_td_loss = masked_lm_loss / gradient_accumulation_steps
+            loss_scaler(scaled_td_loss, TD_optim, create_graph=False, update_grad=True)
+            if max_norm is not None:
+                torch.nn.utils.clip_grad_norm_(TD_train_dict['text_decoder'].parameters(), max_norm)
+            
+            metric_logger.update(masked_lm_loss=masked_lm_loss.item())
 
-        loss_value = total_loss.item()
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
-
-        metric_logger.update(loss=loss_value)
-        metric_logger.update(masked_lm_loss=masked_lm_loss.item())
-
+        # Learning rate logging
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(td_lr=TD_train_dict['optimizer'].param_groups[0]["lr"])
 
-        if (step+1) % 10 == 0 and utils.is_main_process():
-            visual_map = torch.cat((logits_per_image.unsqueeze(0), logits_per_text.unsqueeze(0)))
-            utils.visualization([visual_map,])
+        # Handle NaN losses
+        if not math.isfinite(total_loss_step.item()):
+            print("Loss is {}, stopping training".format(total_loss_step.item()))
+            sys.exit(1)
 
+    # Final metrics and logging
     if args.run:
-        args.run.log({'epoch':epoch+1,'epoch/train_loss':loss_value, 'epoch/masked_lm_loss':masked_lm_loss.item()})
-    # gather the stats from all processes
+        args.run.log({
+            'epoch': epoch+1,
+            'epoch/train_loss': metric_logger.meters['loss'].global_avg,
+            'epoch/masked_lm_loss': metric_logger.meters['masked_lm_loss'].global_avg
+        })
+    
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-
-    return  {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 def evaluate(args, dev_dataloader, model, model_without_ddp, criterion, config, epoch, UNK_IDX, SPECIAL_SYMBOLS, PAD_IDX, device, TD_train_dict):
     model.eval()
@@ -409,7 +451,11 @@ def evaluate(args, dev_dataloader, model, model_without_ddp, criterion, config, 
     with torch.no_grad():
         for step, (src_input, tgt_input, masked_tgt_input) in enumerate(metric_logger.log_every(dev_dataloader, print_freq, header)):
 
-            logits_per_image, logits_per_text, ground_truth = model(src_input, tgt_input)
+            outputs = model(src_input, tgt_input)
+
+            logits_per_image = outputs["logits_per_image"]
+            logits_per_text = outputs["logits_per_text"]
+            ground_truth = outputs["ground_truth"]
             loss_imgs = loss_img(logits_per_image, ground_truth)
             loss_texts = loss_txt(logits_per_text, ground_truth)
 
@@ -441,6 +487,7 @@ def setup_run(args, config):
             project=args.project,
             group=args.output_dir.split('/')[-1],
             config=config,
+            name=f"semantic_lambda_{args.semantic_lambda_mix:.2f}",  # Unique name for each run
         )
         run.define_metric("epoch")
         run.define_metric("training/*", step_metric="epoch")
@@ -452,6 +499,7 @@ def setup_run(args, config):
                 entity=args.entity,
                 project=args.project,
                 config=config,
+                name=f"semantic_lambda_{args.semantic_lambda_mix:.2f}",  # Unique name for rank 0
             )
             run.define_metric("epoch")
             run.define_metric("training/*", step_metric="epoch")
@@ -462,6 +510,8 @@ def setup_run(args, config):
             run = False
 
     return run
+
+
 if __name__ == '__main__':
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"

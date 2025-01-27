@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# Create directories for logs if they don't exist
+mkdir -p logs/finetune_experiments
+
+# Path to the semantic experiments directory
+semantic_dir="/mnt/fast/nobackup/users/ef0036/GFSLT/out/semantic_experiments"
+
+base_port=29501
+
+# Iterate through each directory containing a checkpoint
+for dir in ${semantic_dir}/vlp_semantic_lambda_*; do
+    # Extract the semantic_lambda_mix value from the directory name
+    lambda=$(basename ${dir} | sed 's/vlp_semantic_lambda_//')
+    port=$((base_port + ${RANDOM} % 1000))
+
+    # Path to the best checkpoint for this lambda
+    checkpoint="${dir}/best_checkpoint.pth"
+
+    # Ensure the checkpoint exists
+    if [ ! -f ${checkpoint} ]; then
+        echo "Checkpoint not found: ${checkpoint}"
+        continue
+    fi
+
+    # Generate a unique output directory for this fine-tuning experiment
+    output_dir="out/fine_tune_lambda_${lambda}"
+
+    # SLURM job submission
+    sbatch <<EOT
+#!/bin/bash
+#SBATCH --job-name=finetune-semantic-${lambda}
+#SBATCH --partition=a100
+#SBATCH --gres=gpu:1
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=10
+#SBATCH --mem=100G
+#SBATCH --time=0-10:00:00
+#SBATCH --output=logs/finetune_experiments_2/debug_output-%j-${lambda}.log
+#SBATCH --error=logs/finetune_experiments_2/debug_error-%j-${lambda}.log
+
+# Set environment variables for torchrun
+export HOST_NUM=\${SLURM_NNODES}
+export INDEX=\${SLURM_PROCID}
+export HOST_GPU_NUM=\${SLURM_GPUS_ON_NODE}
+export CHIEF_IP=\$(scontrol show hostname \${SLURM_NODELIST} | head -n 1)
+
+# Debugging: Print values to verify they're set correctly
+echo "HOST_NUM: \${HOST_NUM}"
+echo "INDEX: \${INDEX}"
+echo "HOST_GPU_NUM: \${HOST_GPU_NUM}"
+echo "CHIEF_IP: \${CHIEF_IP}"
+
+# Additional environment variables for torchrun
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export WANDB_API_KEY=b3a33bb694f0df2dfbd61a052b8e6d5aef47dba6
+
+# Debugging: Print SLURM variables to logs
+echo "Running fine-tuning for semantic_lambda=${lambda}"
+
+# Run the fine-tuning command
+apptainer exec --nv --bind /vol/vssp --bind /mnt/fast slt_app.sif bash -c "
+    source /opt/conda/etc/profile.d/conda.sh
+    echo 'Fine-tuning for semantic_lambda_mix=${lambda}'
+
+    python3 -m torch.distributed.launch --nproc_per_node=1 --master_port=${port} --use_env train_slt.py \
+        --batch-size 8 \
+        --epochs 200 \
+        --opt sgd \
+        --lr 0.01 \
+        --output_dir ${output_dir} \
+        --finetune ${checkpoint} \
+	
+"
+EOT
+
+    echo "Submitted fine-tuning job for semantic_lambda=${lambda}"
+done

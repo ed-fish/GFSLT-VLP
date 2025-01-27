@@ -15,18 +15,8 @@ import utils as utils
 
 """ PyTorch MBART model."""
 from transformers import MBartForConditionalGeneration, MBartPreTrainedModel, MBartModel, MBartConfig
-from transformers.modeling_outputs import (
-    BaseModelOutput,
-    BaseModelOutputWithPastAndCrossAttentions,
-    CausalLMOutputWithCrossAttentions,
-    Seq2SeqLMOutput,
-    Seq2SeqModelOutput,
-    Seq2SeqQuestionAnsweringModelOutput,
-    Seq2SeqSequenceClassifierOutput,
-)
 from transformers.models.mbart.modeling_mbart import shift_tokens_right
 
-from transformers.models.mbart.modeling_mbart import MBartLearnedPositionalEmbedding, MBartEncoderLayer, _expand_mask
 
 from collections import OrderedDict
 
@@ -198,38 +188,127 @@ class Text_Decoder(nn.Module):
 
         return lm_logits
     
-        
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
 class SLRCLIP(nn.Module):
-    def __init__(self, config, embed_dim=1024) :
+    def __init__(self, config, embed_dim=1024):
         super(SLRCLIP, self).__init__()
         self.model_txt = TextCLIP(config, inplanes=embed_dim, planes=embed_dim)
         self.model_images = ImageCLIP(config, inplanes=embed_dim, planes=embed_dim)
 
+        # Typical CLIP logit_scale
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.semantic_aware = config["model"]["semantic_aware"]
+        self.semantic_lambda = config["model"]["semantic_lambda"]
 
-    def get_model_txt(self):
-        return self.model_txt
-    
-    @property
-    def get_encoder_hidden_states(self):
-        return self.encoder_hidden_states
-    
-    def forward(self, src_input, tgt_input):
+    def forward(
+        self,
+        src_input,
+        tgt_input,
+    ):
+        """
+        Forward pass that returns:
+          - Original (unadjusted) logits
+          - Optionally, semantic-aware adjusted logits
+          - Image/Text features (normalized)
+          - A ground_truth matrix (1-hot diagonal)
+
+        Args:
+            src_input: Image/Video input batch.
+            tgt_input: Text input batch.
+            compute_semantic_logits: Whether to compute & return the semantic-aware adjusted logits.
+            lambda_param: Weight for scaling the semantic penalty.
+
+        Returns:
+            A dictionary containing some or all of:
+                - logits_per_image
+                - logits_per_text
+                - logits_per_image_semantic (if compute_semantic_logits=True)
+                - logits_per_text_semantic  (if compute_semantic_logits=True)
+                - image_features
+                - text_features
+                - ground_truth (a [B,B] one-hot matrix for convenience)
+        """
+
+        # -------------------------------------------------------
+        # 1) Compute Raw Image & Text Features
+        # -------------------------------------------------------
+        # shape: [B, D]
         image_features = self.model_images(src_input)
         text_features, self.encoder_hidden_states = self.model_txt(tgt_input)
 
-        # normalized features
+        # Normalize to unit vectors
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features  = text_features  / text_features.norm(dim=-1, keepdim=True)
 
-        # cosine similarity as logits
-        logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
-        logits_per_text = logit_scale * text_features @ image_features.t()
+        # -------------------------------------------------------
+        # 2) Compute Original (Unadjusted) Logits
+        # -------------------------------------------------------
+        logit_scale = self.logit_scale.exp()  # scalar
+        logits_per_image = logit_scale * (image_features @ text_features.t())  # [B, B]
+        logits_per_text  = logit_scale * (text_features @ image_features.t())  # [B, B]
 
-        ground_truth = torch.eye(logits_per_image.shape[0], device=logits_per_text.device, dtype=logits_per_image.dtype, requires_grad=False)
+        # A typical ground_truth might be an identity matrix or a diagonal index.
+        # For KL-based or distribution-based training, you might create a [B,B] 1-hot.
+        B = logits_per_image.size(0)
+        device = logits_per_image.device
+        ground_truth = torch.eye(B, device=device, dtype=logits_per_image.dtype)
 
-        return logits_per_image, logits_per_text, ground_truth
+        # Prepare the dictionary to return
+        out_dict = {
+            "logits_per_image": logits_per_image,
+            "logits_per_text":  logits_per_text,
+            "image_features":   image_features,
+            "text_features":    text_features,
+            "ground_truth":     ground_truth,   # optional convenience
+        }
+
+        # -------------------------------------------------------
+        # 3) Skip if NOT computing Semantic-Aware Adjustments
+        # -------------------------------------------------------
+        if not self.semantic_aware:
+            return out_dict
+
+        # -------------------------------------------------------
+        # 4) Compute Semantic-Aware (Adjusted) Logits
+        # -------------------------------------------------------
+        # (a) Visual Similarity Matrix V
+        V = image_features @ image_features.t()  # [B, B]
+        V.fill_diagonal_(0)
+
+        # (b) Semantic Similarity Matrix S
+        S = text_features @ text_features.t()    # [B, B]
+        S.fill_diagonal_(1)
+
+        # (c) Dissimilarity D = (1 - S) / 2
+        D = (1 - S) / 2.0  # in range [0,1]
+
+        # (d) Weight Matrix W = V * D
+        W = V * D
+        w_max = W.max()
+        if w_max > 0:
+            W = (W / w_max) * self.semantic_lambda
+        else:
+            W = W * self.semantic_lambda
+
+        # (e) Mask for negative pairs (off-diagonal)
+        negative_mask = torch.ones_like(W, device=device)
+        negative_mask.fill_diagonal_(0)
+
+        # (f) Adjust the original logits
+        # Subtract W for i != j pairs
+        logits_per_image_semantic = logits_per_image - (W * negative_mask)
+        logits_per_text_semantic  = logits_per_text  - (W.t() * negative_mask)
+
+        # Add them to the return dictionary
+        out_dict["logits_per_image_semantic"] = logits_per_image_semantic
+        out_dict["logits_per_text_semantic"]  = logits_per_text_semantic
+
+        return out_dict
+        
 
 class FeatureExtracter(nn.Module):
     def __init__(self, frozen=False):

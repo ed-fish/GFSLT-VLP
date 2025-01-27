@@ -197,7 +197,7 @@ class S2T_Dataset(Dataset.Dataset):
         src_input['new_src_length_batch'] = new_src_lengths
         
         if self.training_refurbish:
-            masked_tgt = utils.NoiseInjecting(tgt_batch, self.args.noise_rate, noise_type=self.args.noise_type, random_shuffle=self.args.random_shuffle, is_train=(self.phase=='train'))
+            masked_tgt = utils.NoiseInjecting(tgt_batch, self.args.noise_rate, noise_type=self.args.noise_type, random_shuffle=self.args.random_shuffle, is_train=(self.phase=='train'), smart_mask=self.args.smart_mask)
             with self.tokenizer.as_target_tokenizer():
                 masked_tgt_input = self.tokenizer(masked_tgt, return_tensors="pt", padding = True,  truncation=True)
             return src_input, tgt_input, masked_tgt_input
