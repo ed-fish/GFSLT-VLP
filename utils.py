@@ -352,7 +352,7 @@ def gloss_tokens_to_sequences(tokens,tgt_vocab,type = 'tensor'):
             sequences.append(sequence)
         return sequences
 
-def NoiseInjecting(raw_gloss, noise_rate=0.15, noise_type='omit_last', random_shuffle=False, is_train=True):
+def NoiseInjecting(raw_gloss, noise_rate=0.15, noise_type='omit_last', random_shuffle=False, is_train=True, smart_mask=None):
     new_gloss = []
 
     for ii, gloss in enumerate(raw_gloss):
@@ -385,15 +385,21 @@ def NoiseInjecting(raw_gloss, noise_rate=0.15, noise_type='omit_last', random_sh
                         noise_gloss.append(WORD_MASK)
 
         elif noise_type == 'smart_mask':
-            if random.uniform(0, 1) <= 1. and is_train:
-            # Smart mask verbs and nouns with randomness
+            if random.uniform(0, 1) <= 1.0 and is_train:
                 noise_gloss = []
                 for word in text:
-                    if word in pos_dict and pos_dict[word] in ["NOUN"]:
+                    if word in pos_dict and pos_dict[word] in [smart_mask]:
                         if random.uniform(0, 1) < noise_rate:
                             noise_gloss.append(WORD_MASK)
                         else:
                             noise_gloss.append(word)
+                    else:
+                        # Keep the original word if not a NOUN
+                        noise_gloss.append(word)
+            else:
+                # If not training, we don't mask anything.
+                noise_gloss = [word for word in text]
+
         
         if is_train and random_shuffle and random.uniform(0, 1) > 0.5:
             random.shuffle(noise_gloss) # random shuffle sequence

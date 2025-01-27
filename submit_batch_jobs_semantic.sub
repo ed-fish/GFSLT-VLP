@@ -1,0 +1,70 @@
+#!/bin/bash
+
+# Create directories for logs and outputs if they don't exist
+mkdir -p logs/semantic_experiments_txt_img
+mkdir -p out/semantic_experiments_txt_img
+
+# Define the range of semantic_lambda_mix values
+start=0.0
+end=1
+increment=0.25
+
+# Loop through each semantic_lambda_mix value and submit a SLURM job
+for semantic_lambda_mix in $(seq $start $increment $end); do
+    # Generate a unique output directory and log filenames
+    output_dir="out/semantic_experiments_txt_img/vlp_semantic_lambda_${semantic_lambda_mix}"
+    log_file_prefix="logs/semantic_experiments_txt_img/semantic_lambda_${semantic_lambda_mix}"
+
+    # Submit a job for the current semantic_lambda_mix value
+    sbatch <<EOT
+#!/bin/bash
+#SBATCH --job-name=vlp-semantic-${semantic_lambda_mix}
+#SBATCH --partition=a100
+#SBATCH --gres=gpu:1
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=10
+#SBATCH --mem=100G
+#SBATCH --time=0-20:00:00
+#SBATCH --output=${log_file_prefix}_output-%j.log
+#SBATCH --error=${log_file_prefix}_error-%j.log
+
+# Set environment variables for torchrun
+export HOST_NUM=\${SLURM_NNODES}
+export INDEX=\${SLURM_PROCID}
+export HOST_GPU_NUM=\${SLURM_GPUS_ON_NODE}
+export CHIEF_IP=\$(scontrol show hostname \${SLURM_NODELIST} | head -n 1)
+
+# Debugging: Print SLURM variables to logs
+echo "HOST_NUM: \${HOST_NUM}"
+echo "INDEX: \${INDEX}"
+echo "HOST_GPU_NUM: \${HOST_GPU_NUM}"
+echo "CHIEF_IP: \${CHIEF_IP}"
+
+# Additional environment variables for torchrun
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export WANDB_API_KEY=b3a33bb694f0df2dfbd61a052b8e6d5aef47dba6
+
+# Run the training command inside the Apptainer container
+apptainer exec --nv --bind /vol/vssp --bind /mnt/fast slt_apptainer.sif bash -c "
+    source /opt/conda/etc/profile.d/conda.sh
+    echo 'Running torchrun for semantic_lambda_mix=${semantic_lambda_mix}'
+
+    TORCH_DISTRIBUTED_DEBUG=DETAIL HF_DATASETS_OFFLINE=0 TRANSFORMERS_OFFLINE=0 torchrun --nnodes=\${HOST_NUM} --node_rank=\${INDEX} --nproc_per_node=\${HOST_GPU_NUM} --master_addr=\${CHIEF_IP} \
+    -m train_vlp_v2 \
+    --local_rank \${INDEX} \
+    --batch-size 12 \
+    --epochs 150 \
+    --opt sgd \
+    --lr 0.005 \
+    --output_dir ${output_dir} \
+    --noise-rate 0.15 \
+    --noise-type omit_last \
+    --random-shuffle True \
+    --project "VLP-Semantic-Loss" \
+    --name "semantic_lambda_mix_text_img${semantic_lambda_mix}" \
+    --semantic_lambda_mix ${semantic_lambda_mix}
+"
+EOT
+    echo "Submitted job for semantic_lambda_mix=${semantic_lambda_mix}"
+done
+

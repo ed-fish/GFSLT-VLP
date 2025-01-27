@@ -173,6 +173,7 @@ def main(args, config):
     np.random.seed(seed)
     random.seed(seed)
     cudnn.benchmark = False
+    args.distributed = False
 
     print(f"Creating dataset:")
     tokenizer = MBartTokenizer.from_pretrained(config['model']['tokenizer'])
@@ -469,8 +470,8 @@ def evaluate(args, dev_dataloader, model, model_without_ddp, tokenizer, criterio
             for i in range(len(tgt_refs)):
                 f.write(tgt_refs[i]+'\n')
         print('\n'+'*'*80)
-        metrics_dict = compute_metrics(hypothesis=args.output_dir+'/tmp_pres.txt',
-                           references=[args.output_dir+'/tmp_refs.txt'],no_skipthoughts=True,no_glove=True)
+        #metrics_dict = compute_metrics(hypothesis=args.output_dir+'/tmp_pres.txt',
+        #                   references=[args.output_dir+'/tmp_refs.txt'],no_skipthoughts=True,no_glove=True)
         print('*'*80)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -488,7 +489,7 @@ if __name__ == '__main__':
     
     os.environ["WANDB_MODE"] = config['training']['wandb'] if not args.eval else 'disabled'
     if utils.is_main_process():
-        wandb.init(project='GF-SLT',config=config)
+        wandb.init(project='GF-SLT-2',config=config)
         wandb.run.name = args.output_dir.split('/')[-1]
         wandb.define_metric("epoch")
         wandb.define_metric("training/*", step_metric="epoch")
